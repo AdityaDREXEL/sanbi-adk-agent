@@ -67,6 +67,11 @@ async def run_visibility_audit(
     """
     logger.info(f"MCP audit start: domain={domain} topic={topic!r} location={location}")
 
+    domain = (domain or "").strip().rstrip("/")
+    bare = domain.replace("https://", "").replace("http://", "")
+    if not bare or "." not in bare or " " in bare:
+        return {"error": f"'{domain}' doesn't look like a website domain (expected e.g. 'sight360.com')."}
+
     # 1. Plan
     identity = await analyze_brand_identity(domain)
     brand_name = identity.get("brand_name", domain.split(".")[0].title())
@@ -106,7 +111,11 @@ async def run_visibility_audit(
     opportunities = build_opportunities(audit_log)
     top_opps = opportunities[:10]
     if top_opps:
-        verdicts = await verify_urls([o["source_url"] for o in top_opps])
+        try:
+            verdicts = await verify_urls([o["source_url"] for o in top_opps])
+        except Exception as e:
+            logger.error(f"URL verification failed wholesale: {e}")
+            verdicts = {}
         for o in top_opps:
             o["url_verdict"] = verdicts.get(o["source_url"], {}).get("verdict", "unverifiable")
     platform_mix: dict = {}

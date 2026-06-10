@@ -249,7 +249,9 @@ def classify_url(url: str) -> tuple[Optional[str], Optional[str]]:
         parsed = urlparse(url if "://" in url else f"https://{url}")
     except Exception:
         return None, None
-    host = _strip_www(parsed.netloc or "")
+    # .hostname (vs .netloc) strips the port and userinfo and lowercases —
+    # "User@Reddit.COM:443" → "reddit.com". Real citations contain all three.
+    host = _strip_www(parsed.hostname or "")
     if not host:
         return None, None
 

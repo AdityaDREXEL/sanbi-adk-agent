@@ -48,6 +48,8 @@ def _audit_key(audit_id: str) -> str:
 
 def _resolve_audit(tool_context: ToolContext, audit_id: str = "") -> tuple[str, Optional[dict]]:
     """Resolve an audit by id, falling back to the session's active audit."""
+    if tool_context is None:  # defensive: ADK always injects in practice
+        return "", None
     aid = (audit_id or "").strip() or tool_context.state.get(_ACTIVE_KEY, "")
     if not aid:
         return "", None
@@ -85,11 +87,21 @@ async def generate_audit_prompts(
         dict with audit_id (pass to the other tools), brand identity summary,
         and the planned prompts.
     """
+    domain_clean = (brand_domain or "").strip().rstrip("/")
+    bare = domain_clean.replace("https://", "").replace("http://", "")
+    if not bare or "." not in bare or " " in bare:
+        return {
+            "error": f"'{brand_domain}' doesn't look like a domain. "
+                     "Ask the user for a website domain like 'sight360.com'."
+        }
+    if tool_context is None:
+        return {"error": "Internal: tool context missing. Retry the request."}
+
     loc = location or "United States"
-    identity = await analyze_brand_identity(brand_domain)
+    identity = await analyze_brand_identity(domain_clean)
     prompts = await auto_generate_brand_prompts(
         user_topic=topic,
-        domain=brand_domain,
+        domain=domain_clean,
         location=loc,
         max_count=6,
         branded_count=2,
@@ -99,8 +111,8 @@ async def generate_audit_prompts(
 
     audit_id = uuid.uuid4().hex[:12]
     audit = {
-        "domain": brand_domain,
-        "brand_name": identity.get("brand_name", brand_domain.split(".")[0].title()),
+        "domain": domain_clean,
+        "brand_name": identity.get("brand_name", domain_clean.split(".")[0].title()),
         "topic": topic,
         "location": loc,
         "identity": identity,
@@ -275,9 +287,14 @@ async def find_growth_opportunities(audit_id: str = "", tool_context: ToolContex
             "note": "No community/growth surfaces were cited in this audit.",
         }
 
-    # Verify the top of the inbox (real vs hallucinated).
+    # Verify the top of the inbox (real vs hallucinated). A total verification
+    # failure (network down) must degrade, not kill the audit.
     top = opportunities[:12]
-    verdicts = await verify_urls([o["source_url"] for o in top])
+    try:
+        verdicts = await verify_urls([o["source_url"] for o in top])
+    except Exception as e:
+        logger.error(f"URL verification failed wholesale: {e}")
+        verdicts = {}
     for o in top:
         v = verdicts.get(o["source_url"], {})
         o["url_verdict"] = v.get("verdict", "unverifiable")
