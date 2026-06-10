@@ -9,36 +9,40 @@
 
 ## What it does
 
-Brands are losing discoverability as search shifts to AI assistants. Sanbi answers the new question: **"When someone asks an AI for a recommendation in my category, do I show up?"**
+Brands are losing discoverability as search shifts to AI assistants. Sanbi answers the new question: **"When someone asks an AI for a recommendation in my category, do I show up?"** — and then acts on the answer.
 
-The agent runs a 3-step audit pipeline:
+The agent runs a 5-step **measure → act** pipeline:
 
 1. **`generate_audit_prompts`** — researches the brand with **Gemini + Google Search grounding** (Vertex AI), extracts identity (industry, audience, competitors), and generates realistic branded + unbranded buyer queries.
 2. **`query_engines`** — fires every query at multiple AI engines in parallel (OpenAI + Vertex Gemini with grounded search), capturing raw responses and citations.
 3. **`grade_responses`** — LLM-grades each response (visibility, rank, sentiment, competitors mentioned), computes weighted visibility scores, and builds a **competitive leaderboard** + gap analysis + executive summary.
+4. **`find_growth_opportunities`** — classifies every cited source through Sanbi's deterministic platform taxonomy (reddit / forum / Q&A / youtube / reviews / blog / wiki…), ranks them with a replyability-weighted score, and **verifies the URLs are real** — AI engines hallucinate citations, and we prove which ones (HEAD checks, YouTube oEmbed, Reddit OAuth).
+5. **`draft_growth_actions`** — generates a *different* growth motion per surface: authentic reply drafts for forums/reddit, expert answers for Q&A, comment + video briefs for YouTube, review-acquisition plays for review platforms, counter-content briefs for blogs. You can't blog your way into a forum thread — the agent routes work to the right channel automatically.
 
 The agent orchestrates these tools conversationally — raw multi-KB engine responses stay in a server-side audit store; only compact summaries flow through the agent's context.
 
 ## Architecture
 
 ```
-                        ┌──────────────────────────────┐
-  user ── ADK web UI ──▶│  sanbi_audit_agent (ADK)     │
-                        │  model: gemini-2.5-flash     │
-                        │  tools:                      │
-                        │   1. generate_audit_prompts  │──▶ Vertex Gemini + Google Search grounding
-                        │   2. query_engines           │──▶ OpenAI ∥ Vertex Gemini (parallel)
-                        │   3. grade_responses         │──▶ Vertex Gemini (JSON grading)
+                        ┌────────────────────────────────┐
+  user ── ADK web UI ──▶│  sanbi_audit_agent (ADK)       │
+                        │  model: gemini-2.5-flash       │
+                        │  tools:                        │
+                        │   1. generate_audit_prompts    │──▶ Vertex Gemini + Google Search grounding
+                        │   2. query_engines             │──▶ OpenAI ∥ Vertex Gemini (parallel)
+                        │   3. grade_responses           │──▶ Vertex Gemini (JSON grading)
+                        │   4. find_growth_opportunities │──▶ tiered classifier + URL verification
+                        │   5. draft_growth_actions      │──▶ Vertex Gemini (platform-branched drafts)
                         └──────────────┬───────────────┘
                                        │ shares sanbi_core/
                         ┌──────────────▼───────────────┐
-  any MCP client ──────▶│  MCP server (FastMCP)        │
-  (Claude, Gemini CLI)  │  tool: run_visibility_audit  │
-                        └──────────────────────────────┘
+  any MCP client ──────▶│  MCP server (FastMCP)          │
+  (Claude, Gemini CLI)  │  tool: run_visibility_audit    │──▶ full pipeline incl. growth inbox
+                        └────────────────────────────────┘
                                   deployed on Cloud Run
 ```
 
-- **`sanbi_core/`** — the audit engine, ported from production: planning (brand research + prompt generation), execution (multi-engine querying), analysis (grading + leaderboard).
+- **`sanbi_core/`** — the engine, ported from production: planning (brand research + prompt generation), execution (multi-engine querying), analysis (grading + leaderboard), platforms (deterministic citation-source taxonomy), verifier (anti-hallucination URL checks), growth (opportunity scoring + platform playbooks).
 - **`agents/sanbi_audit/`** — ADK agent: conversational orchestration of the pipeline.
 - **`mcp_server/`** — the same audit exposed as a Model Context Protocol tool, so any MCP-capable agent can embed Sanbi audits.
 
@@ -61,7 +65,7 @@ python scripts/smoke_test.py
 adk web agents
 ```
 
-Then chat: *"Audit sight360.com for LASIK surgery in Philadelphia"*.
+Then chat: *"Audit sight360.com for LASIK surgery in Philadelphia — then find where AI engines cite from, verify which sources are real, and draft growth actions for the top opportunities."*
 
 ### Run the MCP server
 

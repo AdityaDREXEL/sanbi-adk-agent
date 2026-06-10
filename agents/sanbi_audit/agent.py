@@ -1,12 +1,14 @@
 """
 agents/sanbi_audit/agent.py — SanbiAuditAgent (ADK root agent).
 
-A single ADK agent with three tools that walk the full Sanbi brand-visibility
-audit pipeline:
+A single ADK agent with five tools that walk the full Sanbi pipeline —
+measure visibility, then act on it:
 
-    1. generate_audit_prompts  → researches the brand, plans audit queries
-    2. query_engines           → runs every prompt across OpenAI + Vertex Gemini
-    3. grade_responses         → LLM-grades each response, builds leaderboard
+    1. generate_audit_prompts      → researches the brand, plans audit queries
+    2. query_engines               → runs every prompt across OpenAI + Vertex Gemini
+    3. grade_responses             → LLM-grades each response, builds leaderboard
+    4. find_growth_opportunities   → classifies + ranks + verifies cited sources
+    5. draft_growth_actions        → platform-branched growth content per source
 
 Design note: raw engine responses are large (5-15k chars each). Tools share
 them through an in-process audit store keyed by audit_id instead of routing
@@ -26,6 +28,8 @@ from google.adk.agents import Agent
 from sanbi_core.planning import analyze_brand_identity, auto_generate_brand_prompts
 from sanbi_core.execution import query_all_engines, ENGINES
 from sanbi_core.analysis import grade_result, build_leaderboard, generate_executive_summary
+from sanbi_core.growth import build_opportunities, draft_growth_action
+from sanbi_core.verifier import verify_urls
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +209,128 @@ async def grade_responses(audit_id: str) -> dict:
 
 
 # ==============================================================================
+# TOOL 4 — Growth opportunity mining (classify → rank → verify)
+# ==============================================================================
+async def find_growth_opportunities(audit_id: str) -> dict:
+    """Find, rank, and verify the community sources AI engines cited.
+
+    Runs every citation from the graded audit through Sanbi's deterministic
+    platform classifier (reddit/forum/qa/youtube/reviews/blog/wiki/...),
+    aggregates citations per URL, and ranks them with the production scoring
+    formula — (engines x 25 + prompt_breadth x 5 + recency x 20) x platform
+    replyability weight. Then verifies the top URLs are REAL (HEAD checks,
+    YouTube oEmbed) — AI engines sometimes hallucinate citations.
+
+    Args:
+        audit_id: The audit session id returned by generate_audit_prompts.
+
+    Returns:
+        dict with platform mix, hallucination check results, and the ranked
+        top opportunities (each with url, platform, score, url_verdict).
+    """
+    audit = _AUDITS.get(audit_id)
+    if not audit:
+        return {"error": f"Unknown audit_id '{audit_id}'. Call generate_audit_prompts first."}
+    if not audit["audit_log"]:
+        return {"error": "Audit not graded yet. Call grade_responses first."}
+
+    opportunities = build_opportunities(audit["audit_log"])
+    if not opportunities:
+        return {
+            "audit_id": audit_id,
+            "total_opportunities": 0,
+            "note": "No community/growth surfaces were cited in this audit.",
+        }
+
+    # Verify the top of the inbox (real vs hallucinated).
+    top = opportunities[:12]
+    verdicts = await verify_urls([o["source_url"] for o in top])
+    for o in top:
+        v = verdicts.get(o["source_url"], {})
+        o["url_verdict"] = v.get("verdict", "unverifiable")
+        o["final_url"] = v.get("final_url")
+    audit["opportunities"] = opportunities
+
+    platform_mix: dict[str, int] = {}
+    for o in opportunities:
+        platform_mix[o["platform"]] = platform_mix.get(o["platform"], 0) + 1
+    verdict_counts: dict[str, int] = {}
+    for o in top:
+        verdict_counts[o["url_verdict"]] = verdict_counts.get(o["url_verdict"], 0) + 1
+
+    return {
+        "audit_id": audit_id,
+        "total_opportunities": len(opportunities),
+        "platform_mix": platform_mix,
+        "url_verification": verdict_counts,
+        "top_opportunities": [
+            {
+                "url": o["source_url"],
+                "platform": o["platform"],
+                "title": o["title"],
+                "engines": o["engines"],
+                "citations": o["citation_count"],
+                "prompts_citing_it": o["prompt_breadth"],
+                "score": o["score"],
+                "url_verdict": o["url_verdict"],
+            }
+            for o in top
+        ],
+        "next_step": "Call draft_growth_actions to generate platform-tailored content for the top real sources.",
+    }
+
+
+# ==============================================================================
+# TOOL 5 — Platform-branched growth drafting
+# ==============================================================================
+async def draft_growth_actions(audit_id: str, top_n: int = 5) -> dict:
+    """Generate platform-tailored growth content for the top verified sources.
+
+    Branches by platform: a Reddit/forum citation gets an authentic reply
+    draft; a Q&A page gets an expert answer; a YouTube video gets a comment +
+    video brief; a review platform gets an acquisition play; a blog gets a
+    counter-content brief + outreach pitch. Hallucinated URLs are skipped.
+
+    Args:
+        audit_id: The audit session id returned by generate_audit_prompts.
+        top_n: How many top opportunities to draft for (default 5).
+
+    Returns:
+        dict with ready-to-use drafts grouped by platform play.
+    """
+    audit = _AUDITS.get(audit_id)
+    if not audit:
+        return {"error": f"Unknown audit_id '{audit_id}'. Call generate_audit_prompts first."}
+    opportunities = audit.get("opportunities") or []
+    if not opportunities:
+        return {"error": "No opportunities mined yet. Call find_growth_opportunities first."}
+
+    usable = [o for o in opportunities if o.get("url_verdict") != "hallucinated"][: max(1, min(top_n, 8))]
+    drafts = []
+    for o in usable:
+        d = await draft_growth_action(o, audit["brand_name"], audit["domain"], audit["topic"])
+        drafts.append({
+            "url": o["source_url"],
+            "platform": o["platform"],
+            "url_verdict": o.get("url_verdict", "unverified"),
+            "score": o["score"],
+            **d,
+        })
+    audit["growth_drafts"] = drafts
+
+    by_play: dict[str, int] = {}
+    for d in drafts:
+        by_play[d["action_type"]] = by_play.get(d["action_type"], 0) + 1
+
+    return {
+        "audit_id": audit_id,
+        "drafts_generated": len(drafts),
+        "plays": by_play,
+        "drafts": drafts,
+    }
+
+
+# ==============================================================================
 # ROOT AGENT
 # ==============================================================================
 root_agent = Agent(
@@ -230,15 +356,37 @@ sight360.com for LASIK surgery?"), run the full audit pipeline:
 3. Call grade_responses(audit_id) — this grades every response and builds
    the competitive leaderboard.
 
-Then present the results clearly:
+After presenting the audit results, ACT on them:
+
+4. Call find_growth_opportunities(audit_id) — this classifies every cited
+   source by platform (reddit, forum, Q&A, youtube, reviews, blog, wiki...),
+   ranks them by Sanbi's replyability-weighted score, and verifies the top
+   URLs are real (AI engines sometimes hallucinate citations — call out any
+   hallucinated ones explicitly).
+
+5. Call draft_growth_actions(audit_id) — this generates a different kind of
+   growth content for each surface: authentic reply drafts for forums and
+   reddit, expert answers for Q&A, comment + video briefs for youtube, review
+   acquisition plays for review platforms, counter-content briefs for blogs.
+
+Then present the full picture:
 - Overall visibility score and rate for the brand
 - Top competitors stealing share of voice (from the leaderboard)
 - Per-engine differences (e.g. visible on Gemini but invisible on ChatGPT)
 - The biggest visibility gaps (unbranded queries where the brand never appears)
-- 2-3 concrete recommendations from the executive summary
+- The growth inbox: where AI actually cites from (platform mix), which
+  citations were hallucinated, and the drafted plays grouped by type
+  (community replies, expert answers, counter-content, review plays)
 
-Be concise and quantitative. Always run all three steps in order — never skip
-grading. If the user gives just a domain with no topic, infer a sensible topic
-from the brand's industry after step 1.""",
-    tools=[generate_audit_prompts, query_engines, grade_responses],
+Be concise and quantitative. Always run steps 1-3 in order — never skip
+grading. Run steps 4-5 by default unless the user only wants the audit. If
+the user gives just a domain with no topic, infer a sensible topic from the
+brand's industry after step 1.""",
+    tools=[
+        generate_audit_prompts,
+        query_engines,
+        grade_responses,
+        find_growth_opportunities,
+        draft_growth_actions,
+    ],
 )

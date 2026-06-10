@@ -26,6 +26,8 @@ from mcp.server.fastmcp import FastMCP
 from sanbi_core.planning import analyze_brand_identity, auto_generate_brand_prompts
 from sanbi_core.execution import query_all_engines
 from sanbi_core.analysis import grade_result, build_leaderboard, generate_executive_summary
+from sanbi_core.growth import build_opportunities
+from sanbi_core.verifier import verify_urls
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -51,7 +53,8 @@ async def run_visibility_audit(
     Researches the brand, generates realistic branded + unbranded audit
     queries, asks them across multiple AI engines (OpenAI + Vertex Gemini),
     grades every response for brand visibility/rank/sentiment, and returns a
-    competitive leaderboard with gap analysis.
+    competitive leaderboard plus a ranked, URL-verified growth inbox of the
+    community sources AI engines actually cited.
 
     Args:
         domain: Brand website domain, e.g. "sight360.com".
@@ -99,6 +102,17 @@ async def run_visibility_audit(
         for e in audit_log if not e["grade"].get("is_visible")
     ]
 
+    # 4. Growth inbox: classify + rank cited sources, verify the top URLs
+    opportunities = build_opportunities(audit_log)
+    top_opps = opportunities[:10]
+    if top_opps:
+        verdicts = await verify_urls([o["source_url"] for o in top_opps])
+        for o in top_opps:
+            o["url_verdict"] = verdicts.get(o["source_url"], {}).get("verdict", "unverifiable")
+    platform_mix: dict = {}
+    for o in opportunities:
+        platform_mix[o["platform"]] = platform_mix.get(o["platform"], 0) + 1
+
     logger.info(
         f"MCP audit done: {brand_name} score={leaderboard['brand']['avg_visibility_score']} "
         f"rate={leaderboard['brand']['visibility_rate']}"
@@ -116,6 +130,21 @@ async def run_visibility_audit(
         "prompts_audited": [p["search_query"] for p in prompts],
         "leaderboard": leaderboard,
         "visibility_gaps": gaps[:10],
+        "growth_inbox": {
+            "total_opportunities": len(opportunities),
+            "platform_mix": platform_mix,
+            "top_opportunities": [
+                {
+                    "url": o["source_url"],
+                    "platform": o["platform"],
+                    "engines": o["engines"],
+                    "citations": o["citation_count"],
+                    "score": o["score"],
+                    "url_verdict": o.get("url_verdict", "unverified"),
+                }
+                for o in top_opps
+            ],
+        },
         "executive_summary": summary,
     }
 
