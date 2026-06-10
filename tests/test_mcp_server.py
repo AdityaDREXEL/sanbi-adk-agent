@@ -24,7 +24,8 @@ PROMPTS = [
 
 VISIBLE_GRADE = {
     "is_visible": True, "rank": 1, "sentiment": "Positive", "visibility_score": 100,
-    "sentiment_score": 100, "cited_sources": [], "source_titles": {},
+    "sentiment_score": 100, "source_titles": {},
+    "cited_sources": ["https://reddit.com/r/lasik/comments/x1/thread"],
     "ranking_table": [{"rank": 2, "name": "LasikPlus", "sentiment": "Neutral", "cited_url": None}],
 }
 INVISIBLE_GRADE = {
@@ -56,6 +57,10 @@ def _mock_pipeline(monkeypatch, identity=None):
         side_effect=[VISIBLE_GRADE, INVISIBLE_GRADE, VISIBLE_GRADE, INVISIBLE_GRADE]))
     monkeypatch.setattr(srv, "generate_executive_summary", AsyncMock(
         return_value={"positioning": "ok", "key_selling_points": [], "negative_risks": []}))
+    monkeypatch.setattr(srv, "verify_urls", AsyncMock(return_value={
+        "https://reddit.com/r/lasik/comments/x1/thread": {
+            "status": 200, "final_url": "https://reddit.com/r/lasik/comments/x1/thread", "verdict": "verified"},
+    }))
 
 
 async def test_run_visibility_audit_full_flow(monkeypatch):
@@ -76,6 +81,18 @@ async def test_run_visibility_audit_full_flow(monkeypatch):
 
     assert len(out["visibility_gaps"]) == 2
     assert out["executive_summary"]["positioning"] == "ok"
+
+    # growth inbox: reddit thread cited by openai on both prompts
+    # → 1 engine × 2 prompts: (25 + 10 + 20) × 1.30 = 71.5
+    inbox = out["growth_inbox"]
+    assert inbox["total_opportunities"] == 1
+    assert inbox["platform_mix"] == {"reddit": 1}
+    top = inbox["top_opportunities"][0]
+    assert top["platform"] == "reddit"
+    assert top["engines"] == ["openai"]
+    assert top["score"] == 71.5
+    assert top["url_verdict"] == "verified"
+    srv.verify_urls.assert_awaited_once()
 
 
 async def test_empty_topic_inferred_from_industry(monkeypatch):

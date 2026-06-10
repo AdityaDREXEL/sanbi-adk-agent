@@ -188,6 +188,18 @@ def _strip_www(host: str) -> str:
     return h
 
 
+def _is_blocked_host(host: str) -> bool:
+    """Blocked shorteners + first-party doc/store/jobs subdomains.
+
+    Blocked-ness must also veto the URL-path fallback in classify_url —
+    docs.example.com/tutorial/x is still a docs page, not a tutorial
+    opportunity.
+    """
+    if not host or host in _BLOCKED:
+        return True
+    return any(host.startswith(b) for b in _BLOCKED_SUBDOMAIN_PREFIXES)
+
+
 def _walk_up(host: str):
     """Yield host and successive parent domains: a.b.c → a.b.c, b.c."""
     parts = host.split(".")
@@ -197,13 +209,8 @@ def _walk_up(host: str):
 
 def _classify_host(host: str) -> Optional[str]:
     """Stage 1-5: classify based on hostname alone (no path)."""
-    if not host or host in _BLOCKED:
+    if _is_blocked_host(host):
         return None
-
-    # Block first-party doc/store/jobs surfaces.
-    for blocked in _BLOCKED_SUBDOMAIN_PREFIXES:
-        if host.startswith(blocked):
-            return None
 
     # Brand override: exact match.
     hit = PLATFORM_BY_DOMAIN.get(host)
@@ -250,12 +257,14 @@ def classify_url(url: str) -> tuple[Optional[str], Optional[str]]:
     if platform:
         return host, platform
 
-    # Path-pattern fallback. Only fires when host signals all whiffed.
-    path = (parsed.path or "").lower()
-    if path:
-        for needle, plat in _PATH_PATTERN_PLATFORM:
-            if needle in path:
-                return host, plat
+    # Path-pattern fallback. Only fires when host signals all whiffed AND the
+    # host isn't explicitly blocked (docs./store./shorteners stay dropped).
+    if not _is_blocked_host(host):
+        path = (parsed.path or "").lower()
+        if path:
+            for needle, plat in _PATH_PATTERN_PLATFORM:
+                if needle in path:
+                    return host, plat
 
     return host, None
 
