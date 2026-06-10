@@ -1,19 +1,24 @@
 """
-agents/sanbi_audit/agent.py — SanbiAuditAgent (ADK root agent).
+agents/sanbi_audit/agent.py — Sanbi multi-agent system (ADK).
 
-A single ADK agent with five tools that walk the full Sanbi pipeline —
-measure visibility, then act on it:
+Agent tree:
 
-    1. generate_audit_prompts      → researches the brand, plans audit queries
-    2. query_engines               → runs every prompt across OpenAI + Vertex Gemini
-    3. grade_responses             → LLM-grades each response, builds leaderboard
-    4. find_growth_opportunities   → classifies + ranks + verifies cited sources
-    5. draft_growth_actions        → platform-branched growth content per source
+    sanbi_coordinator (root, no tools — routes)
+    ├── audit_agent   MEASURE: research → multi-engine queries → grading
+    │                 tools: generate_audit_prompts, query_engines, grade_responses
+    └── growth_agent  ACT: classify → rank → verify citations → draft content
+                      tools: find_growth_opportunities, draft_growth_actions
 
-Design note: raw engine responses are large (5-15k chars each). Tools share
-them through an in-process audit store keyed by audit_id instead of routing
-them through the agent's context window. Each tool returns compact JSON the
-agent can reason over and narrate in the ADK dev UI.
+State: tools share audit data through ADK **session state** (ToolContext.state)
+under "audit:<id>" keys — never through the model's context window. Raw engine
+responses run 5-15k chars each; the model only ever sees compact summaries.
+Both sub-agents read the same session state, which is what makes the
+audit → growth handoff work. State lives in whatever SessionService the runner
+provides (in-memory in the dev UI; swap in a persistent service for production
+without touching tool code).
+
+"active_audit_id" tracks the most recent audit so follow-up tools work even
+when the model omits the id.
 
 Run locally:
     adk web agents          # from repo root → http://localhost:8000
@@ -24,6 +29,7 @@ import uuid
 from typing import Optional
 
 from google.adk.agents import Agent
+from google.adk.tools import ToolContext
 
 from sanbi_core.planning import analyze_brand_identity, auto_generate_brand_prompts
 from sanbi_core.execution import query_all_engines, ENGINES
@@ -33,18 +39,36 @@ from sanbi_core.verifier import verify_urls
 
 logger = logging.getLogger(__name__)
 
-# ------------------------------------------------------------------------------
-# In-process audit session store.
-# Cloud Run demo scale = 1 instance, so module state is fine. The production
-# refactor swaps this for AlloyDB / Memorystore (see README roadmap).
-# ------------------------------------------------------------------------------
-_AUDITS: dict[str, dict] = {}
+_ACTIVE_KEY = "active_audit_id"
+
+
+def _audit_key(audit_id: str) -> str:
+    return f"audit:{audit_id}"
+
+
+def _resolve_audit(tool_context: ToolContext, audit_id: str = "") -> tuple[str, Optional[dict]]:
+    """Resolve an audit by id, falling back to the session's active audit."""
+    aid = (audit_id or "").strip() or tool_context.state.get(_ACTIVE_KEY, "")
+    if not aid:
+        return "", None
+    return aid, tool_context.state.get(_audit_key(aid))
+
+
+def _save_audit(tool_context: ToolContext, audit_id: str, audit: dict) -> None:
+    """Write the audit to session state (assignment is what State delta-tracks)."""
+    tool_context.state[_audit_key(audit_id)] = audit
+    tool_context.state[_ACTIVE_KEY] = audit_id
 
 
 # ==============================================================================
 # TOOL 1 — Plan the audit
 # ==============================================================================
-async def generate_audit_prompts(brand_domain: str, topic: str, location: Optional[str] = None) -> dict:
+async def generate_audit_prompts(
+    brand_domain: str,
+    topic: str,
+    location: Optional[str] = None,
+    tool_context: ToolContext = None,
+) -> dict:
     """Research a brand and generate the audit prompt plan.
 
     Researches the company behind `brand_domain` using Google-Search-grounded
@@ -74,7 +98,7 @@ async def generate_audit_prompts(brand_domain: str, topic: str, location: Option
     )
 
     audit_id = uuid.uuid4().hex[:12]
-    _AUDITS[audit_id] = {
+    audit = {
         "domain": brand_domain,
         "brand_name": identity.get("brand_name", brand_domain.split(".")[0].title()),
         "topic": topic,
@@ -84,10 +108,11 @@ async def generate_audit_prompts(brand_domain: str, topic: str, location: Option
         "responses": [],   # filled by query_engines
         "audit_log": [],   # filled by grade_responses
     }
+    _save_audit(tool_context, audit_id, audit)
 
     return {
         "audit_id": audit_id,
-        "brand_name": _AUDITS[audit_id]["brand_name"],
+        "brand_name": audit["brand_name"],
         "industry": identity.get("industry"),
         "target_audience": identity.get("target_audience"),
         "known_competitors": identity.get("competitors", [])[:5],
@@ -101,29 +126,31 @@ async def generate_audit_prompts(brand_domain: str, topic: str, location: Option
 # ==============================================================================
 # TOOL 2 — Query the engines
 # ==============================================================================
-async def query_engines(audit_id: str) -> dict:
+async def query_engines(audit_id: str = "", tool_context: ToolContext = None) -> dict:
     """Run every planned prompt across all AI engines (OpenAI + Vertex Gemini).
 
     Each engine answers independently using its native capabilities (Gemini
     uses live Google Search grounding; OpenAI answers from training data).
-    Raw responses are stored server-side; this returns compact previews.
+    Raw responses are stored in session state; this returns compact previews.
 
     Args:
-        audit_id: The audit session id returned by generate_audit_prompts.
+        audit_id: The audit session id. Empty = the most recent audit in
+            this session.
 
     Returns:
         dict with per-prompt, per-engine response previews and citation counts.
     """
-    audit = _AUDITS.get(audit_id)
+    aid, audit = _resolve_audit(tool_context, audit_id)
     if not audit:
-        return {"error": f"Unknown audit_id '{audit_id}'. Call generate_audit_prompts first."}
+        return {"error": f"Unknown audit_id '{audit_id or aid}'. Call generate_audit_prompts first."}
 
+    responses = []
     previews = []
     for p in audit["prompts"]:
         prompt_text = p["search_query"]
         engine_results = await query_all_engines(prompt_text, audit["location"])
         for engine, res in engine_results.items():
-            audit["responses"].append({
+            responses.append({
                 "prompt": prompt_text,
                 "prompt_type": p["prompt_type"],
                 "engine": engine,
@@ -136,10 +163,13 @@ async def query_engines(audit_id: str) -> dict:
                 "citations_found": len(res.get("citations", [])),
             })
 
+    audit["responses"] = responses
+    _save_audit(tool_context, aid, audit)
+
     return {
-        "audit_id": audit_id,
+        "audit_id": aid,
         "engines": ENGINES,
-        "responses_collected": len(audit["responses"]),
+        "responses_collected": len(responses),
         "previews": previews,
         "next_step": "Call grade_responses with this audit_id.",
     }
@@ -148,7 +178,7 @@ async def query_engines(audit_id: str) -> dict:
 # ==============================================================================
 # TOOL 3 — Grade + leaderboard
 # ==============================================================================
-async def grade_responses(audit_id: str) -> dict:
+async def grade_responses(audit_id: str = "", tool_context: ToolContext = None) -> dict:
     """Grade every engine response and build the competitive leaderboard.
 
     For each stored response, an LLM grader determines: is the brand visible,
@@ -157,15 +187,16 @@ async def grade_responses(audit_id: str) -> dict:
     the leaderboard, per-engine breakdown, and executive summary.
 
     Args:
-        audit_id: The audit session id returned by generate_audit_prompts.
+        audit_id: The audit session id. Empty = the most recent audit in
+            this session.
 
     Returns:
         dict with brand score, competitor leaderboard, per-engine stats,
         gap analysis (prompts where the brand was invisible), and summary.
     """
-    audit = _AUDITS.get(audit_id)
+    aid, audit = _resolve_audit(tool_context, audit_id)
     if not audit:
-        return {"error": f"Unknown audit_id '{audit_id}'. Call generate_audit_prompts first."}
+        return {"error": f"Unknown audit_id '{audit_id or aid}'. Call generate_audit_prompts first."}
     if not audit["responses"]:
         return {"error": "No responses collected yet. Call query_engines first."}
 
@@ -179,6 +210,7 @@ async def grade_responses(audit_id: str) -> dict:
             "grade": grade,
         })
     audit["audit_log"] = audit_log
+    _save_audit(tool_context, aid, audit)
 
     leaderboard = build_leaderboard(audit_log, audit["brand_name"])
     summary = await generate_executive_summary(audit["domain"], audit_log)
@@ -190,7 +222,7 @@ async def grade_responses(audit_id: str) -> dict:
     ]
 
     return {
-        "audit_id": audit_id,
+        "audit_id": aid,
         "leaderboard": leaderboard,
         "visibility_gaps": gaps[:10],
         "executive_summary": summary,
@@ -211,7 +243,7 @@ async def grade_responses(audit_id: str) -> dict:
 # ==============================================================================
 # TOOL 4 — Growth opportunity mining (classify → rank → verify)
 # ==============================================================================
-async def find_growth_opportunities(audit_id: str) -> dict:
+async def find_growth_opportunities(audit_id: str = "", tool_context: ToolContext = None) -> dict:
     """Find, rank, and verify the community sources AI engines cited.
 
     Runs every citation from the graded audit through Sanbi's deterministic
@@ -222,22 +254,23 @@ async def find_growth_opportunities(audit_id: str) -> dict:
     YouTube oEmbed) — AI engines sometimes hallucinate citations.
 
     Args:
-        audit_id: The audit session id returned by generate_audit_prompts.
+        audit_id: The audit session id. Empty = the most recent audit in
+            this session.
 
     Returns:
         dict with platform mix, hallucination check results, and the ranked
         top opportunities (each with url, platform, score, url_verdict).
     """
-    audit = _AUDITS.get(audit_id)
+    aid, audit = _resolve_audit(tool_context, audit_id)
     if not audit:
-        return {"error": f"Unknown audit_id '{audit_id}'. Call generate_audit_prompts first."}
+        return {"error": f"Unknown audit_id '{audit_id or aid}'. Call generate_audit_prompts first."}
     if not audit["audit_log"]:
         return {"error": "Audit not graded yet. Call grade_responses first."}
 
     opportunities = build_opportunities(audit["audit_log"])
     if not opportunities:
         return {
-            "audit_id": audit_id,
+            "audit_id": aid,
             "total_opportunities": 0,
             "note": "No community/growth surfaces were cited in this audit.",
         }
@@ -250,6 +283,7 @@ async def find_growth_opportunities(audit_id: str) -> dict:
         o["url_verdict"] = v.get("verdict", "unverifiable")
         o["final_url"] = v.get("final_url")
     audit["opportunities"] = opportunities
+    _save_audit(tool_context, aid, audit)
 
     platform_mix: dict[str, int] = {}
     for o in opportunities:
@@ -259,7 +293,7 @@ async def find_growth_opportunities(audit_id: str) -> dict:
         verdict_counts[o["url_verdict"]] = verdict_counts.get(o["url_verdict"], 0) + 1
 
     return {
-        "audit_id": audit_id,
+        "audit_id": aid,
         "total_opportunities": len(opportunities),
         "platform_mix": platform_mix,
         "url_verification": verdict_counts,
@@ -283,7 +317,11 @@ async def find_growth_opportunities(audit_id: str) -> dict:
 # ==============================================================================
 # TOOL 5 — Platform-branched growth drafting
 # ==============================================================================
-async def draft_growth_actions(audit_id: str, top_n: int = 5) -> dict:
+async def draft_growth_actions(
+    audit_id: str = "",
+    top_n: int = 5,
+    tool_context: ToolContext = None,
+) -> dict:
     """Generate platform-tailored growth content for the top verified sources.
 
     Branches by platform: a Reddit/forum citation gets an authentic reply
@@ -292,15 +330,16 @@ async def draft_growth_actions(audit_id: str, top_n: int = 5) -> dict:
     counter-content brief + outreach pitch. Hallucinated URLs are skipped.
 
     Args:
-        audit_id: The audit session id returned by generate_audit_prompts.
+        audit_id: The audit session id. Empty = the most recent audit in
+            this session.
         top_n: How many top opportunities to draft for (default 5).
 
     Returns:
         dict with ready-to-use drafts grouped by platform play.
     """
-    audit = _AUDITS.get(audit_id)
+    aid, audit = _resolve_audit(tool_context, audit_id)
     if not audit:
-        return {"error": f"Unknown audit_id '{audit_id}'. Call generate_audit_prompts first."}
+        return {"error": f"Unknown audit_id '{audit_id or aid}'. Call generate_audit_prompts first."}
     opportunities = audit.get("opportunities") or []
     if not opportunities:
         return {"error": "No opportunities mined yet. Call find_growth_opportunities first."}
@@ -317,13 +356,14 @@ async def draft_growth_actions(audit_id: str, top_n: int = 5) -> dict:
             **d,
         })
     audit["growth_drafts"] = drafts
+    _save_audit(tool_context, aid, audit)
 
     by_play: dict[str, int] = {}
     for d in drafts:
         by_play[d["action_type"]] = by_play.get(d["action_type"], 0) + 1
 
     return {
-        "audit_id": audit_id,
+        "audit_id": aid,
         "drafts_generated": len(drafts),
         "plays": by_play,
         "drafts": drafts,
@@ -331,62 +371,101 @@ async def draft_growth_actions(audit_id: str, top_n: int = 5) -> dict:
 
 
 # ==============================================================================
-# ROOT AGENT
+# AGENT TREE
 # ==============================================================================
-root_agent = Agent(
-    name="sanbi_audit_agent",
-    model="gemini-2.5-flash",
+_MODEL = "gemini-2.5-flash"
+
+audit_agent = Agent(
+    name="audit_agent",
+    model=_MODEL,
     description=(
-        "Sanbi AI visibility auditor: measures whether AI assistants "
-        "(ChatGPT, Gemini) recommend a brand or its competitors, and why."
+        "Measurement specialist: researches a brand, audits it across OpenAI "
+        "and Vertex Gemini, grades every response, and builds the competitive "
+        "visibility leaderboard."
     ),
-    instruction="""You are Sanbi, an AI visibility auditor.
+    instruction="""You are Sanbi's audit specialist. You MEASURE a brand's AI visibility.
 
-When a user asks about a brand's AI visibility (e.g. "How visible is
-sight360.com for LASIK surgery?"), run the full audit pipeline:
+Run the measurement pipeline in strict order:
 
-1. Call generate_audit_prompts(brand_domain, topic) — this researches the
-   company and plans realistic branded + unbranded audit queries.
-   Briefly tell the user what you learned about the brand and which
-   queries you'll audit.
+1. generate_audit_prompts(brand_domain, topic) — researches the company and
+   plans realistic branded + unbranded audit queries. Briefly tell the user
+   what you learned about the brand and which queries you'll audit.
 
-2. Call query_engines(audit_id) — this asks every query across OpenAI and
-   Vertex Gemini independently. Summarize what the engines said at a glance.
+2. query_engines() — asks every query across OpenAI and Vertex Gemini
+   independently. Summarize what the engines said at a glance.
 
-3. Call grade_responses(audit_id) — this grades every response and builds
-   the competitive leaderboard.
+3. grade_responses() — grades every response and builds the leaderboard.
 
-After presenting the audit results, ACT on them:
-
-4. Call find_growth_opportunities(audit_id) — this classifies every cited
-   source by platform (reddit, forum, Q&A, youtube, reviews, blog, wiki...),
-   ranks them by Sanbi's replyability-weighted score, and verifies the top
-   URLs are real (AI engines sometimes hallucinate citations — call out any
-   hallucinated ones explicitly).
-
-5. Call draft_growth_actions(audit_id) — this generates a different kind of
-   growth content for each surface: authentic reply drafts for forums and
-   reddit, expert answers for Q&A, comment + video briefs for youtube, review
-   acquisition plays for review platforms, counter-content briefs for blogs.
-
-Then present the full picture:
+Then present, concisely and quantitatively:
 - Overall visibility score and rate for the brand
-- Top competitors stealing share of voice (from the leaderboard)
+- Top competitors stealing share of voice
 - Per-engine differences (e.g. visible on Gemini but invisible on ChatGPT)
-- The biggest visibility gaps (unbranded queries where the brand never appears)
-- The growth inbox: where AI actually cites from (platform mix), which
-  citations were hallucinated, and the drafted plays grouped by type
-  (community replies, expert answers, counter-content, review plays)
+- The biggest gaps (unbranded queries where the brand never appears)
 
-Be concise and quantitative. Always run steps 1-3 in order — never skip
-grading. Run steps 4-5 by default unless the user only wants the audit. If
-the user gives just a domain with no topic, infer a sensible topic from the
-brand's industry after step 1.""",
-    tools=[
-        generate_audit_prompts,
-        query_engines,
-        grade_responses,
-        find_growth_opportunities,
-        draft_growth_actions,
-    ],
+Never skip grading. If the user gives just a domain with no topic, infer a
+sensible topic from the brand's industry after step 1.
+
+When the audit is done, offer the growth phase. If the user wants growth
+opportunities, citation analysis, or content drafts, transfer to growth_agent
+— the audit data is already in this session's state.""",
+    tools=[generate_audit_prompts, query_engines, grade_responses],
+)
+
+growth_agent = Agent(
+    name="growth_agent",
+    model=_MODEL,
+    description=(
+        "Action specialist: classifies the sources AI engines cited, ranks "
+        "them by replyability, verifies they are real (anti-hallucination), "
+        "and drafts platform-tailored growth actions."
+    ),
+    instruction="""You are Sanbi's growth specialist. You ACT on a completed audit.
+
+You need a graded audit in this session. If the tools report there is none,
+transfer to audit_agent to run the measurement first.
+
+1. find_growth_opportunities() — classifies every cited source by platform
+   (reddit, forum, Q&A, youtube, reviews, blog, wiki...), ranks them by
+   Sanbi's replyability-weighted score, and verifies the top URLs are real.
+   AI engines sometimes hallucinate citations — call out any hallucinated
+   URLs explicitly.
+
+2. draft_growth_actions() — generates a different kind of growth content for
+   each surface: authentic reply drafts for forums and reddit, expert answers
+   for Q&A, comment + video briefs for youtube, review acquisition plays for
+   review platforms, counter-content briefs for blogs.
+
+Present the growth inbox clearly: platform mix, verification verdicts (flag
+hallucinations prominently), then the drafted plays grouped by type
+(community replies, expert answers, counter-content, review plays).""",
+    tools=[find_growth_opportunities, draft_growth_actions],
+)
+
+root_agent = Agent(
+    name="sanbi_coordinator",
+    model=_MODEL,
+    description=(
+        "Sanbi AI-visibility coordinator: measures whether AI assistants "
+        "recommend a brand, then turns the findings into growth actions. "
+        "Routes between the audit (measure) and growth (act) specialists."
+    ),
+    instruction="""You are Sanbi, an AI-visibility coordinator. Sanbi measures whether AI
+assistants (ChatGPT, Gemini) recommend a brand — and then turns those findings
+into concrete growth actions.
+
+You do not run tools yourself. You route:
+
+- Audit / visibility requests ("audit X", "how visible is X for Y?") →
+  transfer to audit_agent.
+- Growth requests on a completed audit ("where do AI engines cite from?",
+  "verify those sources", "draft growth actions / replies") →
+  transfer to growth_agent.
+
+For a combined request like "audit X and draft growth actions for the top
+sources", start with audit_agent — the specialists hand off between
+themselves and share this session's audit state.
+
+If the user asks what you can do, explain the measure → act pipeline in two
+sentences, then ask for a brand domain and topic.""",
+    sub_agents=[audit_agent, growth_agent],
 )

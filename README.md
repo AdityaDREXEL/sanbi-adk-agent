@@ -19,32 +19,54 @@ The agent runs a 5-step **measure → act** pipeline:
 4. **`find_growth_opportunities`** — classifies every cited source through Sanbi's deterministic platform taxonomy (reddit / forum / Q&A / youtube / reviews / blog / wiki…), ranks them with a replyability-weighted score, and **verifies the URLs are real** — AI engines hallucinate citations, and we prove which ones (HEAD checks, YouTube oEmbed, Reddit OAuth).
 5. **`draft_growth_actions`** — generates a *different* growth motion per surface: authentic reply drafts for forums/reddit, expert answers for Q&A, comment + video briefs for YouTube, review-acquisition plays for review platforms, counter-content briefs for blogs. You can't blog your way into a forum thread — the agent routes work to the right channel automatically.
 
-The agent orchestrates these tools conversationally — raw multi-KB engine responses stay in a server-side audit store; only compact summaries flow through the agent's context.
+A **coordinator agent** routes the conversation between two specialists — an audit agent (measure, tools 1–3) and a growth agent (act, tools 4–5) — that share audit data through **ADK session state**. Raw multi-KB engine responses live in session state, never in the model's context window; only compact summaries flow through the agents.
 
 ## Architecture
 
 ```
                         ┌────────────────────────────────┐
-  user ── ADK web UI ──▶│  sanbi_audit_agent (ADK)       │
-                        │  model: gemini-2.5-flash       │
-                        │  tools:                        │
-                        │   1. generate_audit_prompts    │──▶ Vertex Gemini + Google Search grounding
-                        │   2. query_engines             │──▶ OpenAI ∥ Vertex Gemini (parallel)
-                        │   3. grade_responses           │──▶ Vertex Gemini (JSON grading)
-                        │   4. find_growth_opportunities │──▶ tiered classifier + URL verification
-                        │   5. draft_growth_actions      │──▶ Vertex Gemini (platform-branched drafts)
-                        └──────────────┬───────────────┘
-                                       │ shares sanbi_core/
-                        ┌──────────────▼───────────────┐
-  any MCP client ──────▶│  MCP server (FastMCP)          │
-  (Claude, Gemini CLI)  │  tool: run_visibility_audit    │──▶ full pipeline incl. growth inbox
-                        └────────────────────────────────┘
+  user ── ADK web UI ──▶│  sanbi_coordinator (root agent)  │   model: gemini-2.5-flash
+                        │  routes; no tools of its own     │
+                        └─────┬────────────────┬─────────┘
+                   transfer│                  │transfer
+              ┌───────────▼───────┐  ┌───────▼──────────────┐
+              │  audit_agent       │  │  growth_agent        │
+              │  MEASURE           │  │  ACT                 │
+              │  1. generate_audit │  │  4. find_growth_     │
+              │     _prompts       │  │     opportunities    │
+              │  2. query_engines  │  │     (classify→rank   │
+              │  3. grade_responses│  │      →verify URLs)   │
+              │                    │  │  5. draft_growth_    │
+              │                    │  │     actions          │
+              └─────────┬─────────┘  └──────────┬─────────┘
+                        │ shared ADK session state │
+                        │ ("audit:<id>" entries)   │
+                        ┌─────────────▼─────────────┐
+                        │        sanbi_core/        │──▶ Vertex Gemini + Google Search grounding
+                        └─────────────┬─────────────┘──▶ OpenAI ∥ Vertex Gemini (parallel)
+                                      │
+                        ┌─────────────▼─────────────┐
+  any MCP client ──────▶│  MCP server (FastMCP)     │
+  (Claude, Gemini CLI)  │  run_visibility_audit     │──▶ full pipeline incl. growth inbox
+                        └─────────────────────────┘
                                   deployed on Cloud Run
 ```
 
 - **`sanbi_core/`** — the engine, ported from production: planning (brand research + prompt generation), execution (multi-engine querying), analysis (grading + leaderboard), platforms (deterministic citation-source taxonomy), verifier (anti-hallucination URL checks), growth (opportunity scoring + platform playbooks).
-- **`agents/sanbi_audit/`** — ADK agent: conversational orchestration of the pipeline.
+- **`agents/sanbi_audit/`** — the ADK multi-agent system: coordinator + audit/growth specialists.
 - **`mcp_server/`** — the same audit exposed as a Model Context Protocol tool, so any MCP-capable agent can embed Sanbi audits.
+
+### ADK design notes
+
+- **Multi-agent delegation** — the coordinator owns no tools; it `transfer`s to `audit_agent` or `growth_agent` based on intent, and the specialists hand off to each other (audit → growth) when the user wants the full pipeline.
+- **Session state, not context stuffing** — tools receive ADK's `ToolContext` and persist audits in `tool_context.state` under `audit:<id>` keys. Raw engine responses (5–15k chars each) never enter the model's window. State lives in whatever `SessionService` the runner provides — in-memory in the dev UI, swappable to a persistent service in production *without touching tool code*.
+- **Demo-robust tool contracts** — every post-planning tool takes `audit_id: str = ""` and falls back to the session's `active_audit_id`, so a model that forgets to thread the id still lands on the right audit.
+- **Agent evaluation** — a starter evalset lives in [agents/sanbi_audit/evalsets/](agents/sanbi_audit/evalsets/) (generated by `scripts/make_evalset.py` from ADK's own schema models):
+
+```bash
+adk eval agents/sanbi_audit agents/sanbi_audit/evalsets/routing.evalset.json \
+    --config_file_path agents/sanbi_audit/evalsets/test_config.json
+```
 
 ## Quickstart
 
@@ -90,7 +112,7 @@ gcloud run deploy sanbi-adk-agent \
 
 ## Tests
 
-134 offline tests cover the scoring formula, LLM-output coercion (None/string ranks, fenced JSON), citation extraction + Google-redirect filtering, leaderboard aggregation, engine-failure isolation, the agent's audit-store flow, and the MCP tool contract. All LLM calls are mocked — the suite runs with zero credentials and zero API spend.
+244 offline tests cover the scoring formula, LLM-output coercion (None/string ranks, fenced JSON), citation extraction + Google-redirect filtering, leaderboard aggregation, engine-failure isolation, the platform classifier taxonomy, URL-verification verdicts (incl. the Reddit-OAuth and YouTube-oEmbed edge cases), growth-opportunity scoring to the decimal, the agents' session-state flow, and the MCP tool contract. All LLM/HTTP calls are mocked — the suite runs with zero credentials and zero API spend.
 
 ```bash
 pip install -r requirements-dev.txt
