@@ -27,6 +27,16 @@ logger = logging.getLogger(__name__)
 _BARE_DOMAIN_RE = re.compile(r'^[\w][\w.-]*\.[a-z]{2,}$', re.IGNORECASE)
 
 
+def _strip_code_fences(raw: str) -> str:
+    """Strip markdown code fences: ```json ... ```, ``` ... ```, any language tag."""
+    raw = (raw or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-zA-Z]*\s*", "", raw)
+    if raw.endswith("```"):
+        raw = raw[:-3]
+    return raw.strip()
+
+
 async def _resolve_one(client: httpx.AsyncClient, uri: str, title: str) -> str:
     """
     Follow a vertexaisearch redirect one hop to get the actual public URL.
@@ -165,12 +175,7 @@ async def gemini_force_json(text_context: str, json_schema_prompt: str) -> dict:
                 contents=formatting_prompt,
                 config=config_settings,
             )
-            raw_text = (resp.text or "").strip()
-            if raw_text.startswith("```json"):
-                raw_text = raw_text[7:]
-            if raw_text.endswith("```"):
-                raw_text = raw_text[:-3]
-            return json.loads(raw_text)
+            return json.loads(_strip_code_fences(resp.text or ""))
         except Exception as e:
             logger.warning(f"JSON formatting failed (attempt {attempt + 1}): {e}")
             await asyncio.sleep(0.5)
@@ -211,12 +216,7 @@ RESPOND IN STRICT JSON FORMAT. No markdown, no code fences.
                 contents=combined_prompt,
                 config=config_settings,
             )
-            raw_text = (resp.text or "").strip()
-            if raw_text.startswith("```json"):
-                raw_text = raw_text[7:]
-            if raw_text.endswith("```"):
-                raw_text = raw_text[:-3]
-            return json.loads(raw_text)
+            return json.loads(_strip_code_fences(resp.text or ""))
         except Exception as e:
             logger.warning(f"Single JSON call failed (attempt {attempt + 1}): {e}")
             await asyncio.sleep(0.5)

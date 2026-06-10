@@ -7,6 +7,10 @@ Run after configuring .env:
 
 import asyncio
 import sys
+from pathlib import Path
+
+# Allow `python scripts/smoke_test.py` from the repo root (and anywhere else).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 async def main() -> int:
@@ -33,7 +37,11 @@ async def main() -> int:
     try:
         from sanbi_core.gemini import gemini_grounded_text
         text, sources = await gemini_grounded_text("Who founded Allegro MicroSystems?", use_search=True)
-        print(f"  ✅ {len(text)} chars, {len(sources)} grounded sources")
+        if not text:
+            print("  ❌ empty grounded response — client not initialized or call failed")
+            ok = False
+        else:
+            print(f"  ✅ {len(text)} chars, {len(sources)} grounded sources")
     except Exception as e:
         print(f"  ❌ {e}")
         ok = False

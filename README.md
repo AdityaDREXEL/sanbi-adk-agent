@@ -84,6 +84,15 @@ gcloud run deploy sanbi-adk-agent \
   --set-secrets OPENAI_API_KEY=openai-api-key:latest
 ```
 
+## Tests
+
+134 offline tests cover the scoring formula, LLM-output coercion (None/string ranks, fenced JSON), citation extraction + Google-redirect filtering, leaderboard aggregation, engine-failure isolation, the agent's audit-store flow, and the MCP tool contract. All LLM calls are mocked — the suite runs with zero credentials and zero API spend.
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
 ## Tech
 
 | Layer | Tech |

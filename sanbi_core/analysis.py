@@ -17,6 +17,22 @@ from .gemini import robust_json_call
 
 logger = logging.getLogger(__name__)
 
+# Engine-level failure texts that must never be sent to the (paid) LLM grader.
+_ERROR_PREFIXES = ("Error:", "[OpenAI Error]", "OpenAI API key missing", "Unknown engine:")
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    """Coerce LLM-returned rank values (None, "2", "N/A", 3.0) to int."""
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _norm_brand(name: str) -> str:
+    """Normalize brand names for comparison: 'Sight 360' == 'sight360'."""
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
 
 def calculate_aeo_score(rank: int, sentiment: str) -> int:
     """
@@ -61,11 +77,12 @@ async def grade_result(prompt: str, response_data: Dict[str, Any], brand_domain:
     api_citations = response_data.get("citations", [])
 
     # Cost guard: skip grading if the engine returned nothing useful
-    if not response_text or len(response_text.strip()) < 20 or response_text.strip().startswith(("Error:", "[OpenAI Error]")):
+    if not response_text or len(response_text.strip()) < 20 or response_text.strip().startswith(_ERROR_PREFIXES):
         logger.info(f"Skipping grading — empty or error response ({len(response_text)} chars)")
         return _empty_grade()
 
-    brand_name = brand_domain.split(".")[0].replace("-", " ").strip().title()
+    clean_domain = brand_domain.replace("https://", "").replace("http://", "").replace("www.", "")
+    brand_name = clean_domain.split(".")[0].replace("-", " ").strip().title()
 
     reasoning_prompt = f"""
     You are an AI Auditor analyzing a search engine response for the brand '{brand_name}'.
@@ -140,10 +157,11 @@ async def grade_result(prompt: str, response_data: Dict[str, Any], brand_domain:
         data["source_titles"] = final_titles
 
         # Normalize + score
-        rank = int(data.get("rank", 0))
-        sentiment = str(data.get("sentiment", "Neutral"))
+        rank = _safe_int(data.get("rank", 0))
+        sentiment = str(data.get("sentiment") or "Neutral")
+        s_low = sentiment.lower()
         data["visibility_score"] = calculate_aeo_score(rank, sentiment)
-        data["sentiment_score"] = 100 if sentiment == "Positive" else (50 if sentiment == "Neutral" else 0)
+        data["sentiment_score"] = 100 if "positive" in s_low else (0 if "negative" in s_low else 50)
         data["rank"] = rank
         data["sentiment"] = sentiment
         data["is_visible"] = bool(data.get("is_visible", False))
@@ -152,9 +170,9 @@ async def grade_result(prompt: str, response_data: Dict[str, Any], brand_domain:
         for i, row in enumerate(data.get("ranking_table", [])[:5], start=1):
             if isinstance(row, dict):
                 normalized_table.append({
-                    "rank": row.get("rank", i),
-                    "name": str(row.get("name", "Unknown")),
-                    "sentiment": str(row.get("sentiment", "Neutral")),
+                    "rank": _safe_int(row.get("rank", i), i),
+                    "name": str(row.get("name") or "Unknown"),
+                    "sentiment": str(row.get("sentiment") or "Neutral"),
                     "cited_url": row.get("cited_url", None),
                 })
         data["ranking_table"] = normalized_table
@@ -211,14 +229,13 @@ def build_leaderboard(audit_log: List[Dict[str, Any]], brand_name: str) -> Dict[
 
         for row in grade.get("ranking_table", []):
             name = (row.get("name") or "").strip()
-            if not name or name.lower() == brand_name.lower():
+            if not name or _norm_brand(name) == _norm_brand(brand_name):
                 continue
             cs = competitor_stats.setdefault(name, {"mentions": 0, "ranks": []})
             cs["mentions"] += 1
-            try:
-                cs["ranks"].append(int(row.get("rank", 0)))
-            except (TypeError, ValueError):
-                pass
+            r = _safe_int(row.get("rank", 0))
+            if r > 0:
+                cs["ranks"].append(r)
 
     total_mentions = sum(c["mentions"] for c in competitor_stats.values()) + brand_visible
 
