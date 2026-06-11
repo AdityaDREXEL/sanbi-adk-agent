@@ -153,9 +153,10 @@ async def generate_audit_prompts(
 async def query_engines(audit_id: str = "", tool_context: ToolContext = None) -> dict:
     """Run every planned prompt across all AI engines (OpenAI + Vertex Gemini).
 
-    Each engine answers independently using its native capabilities (Gemini
-    uses live Google Search grounding; OpenAI answers from training data).
-    Raw responses are stored in session state; this returns compact previews.
+    Each engine answers independently using its native live-web capabilities
+    (Gemini uses Google Search grounding; OpenAI uses web search) and returns
+    its own citations. Raw responses are stored in session state; this
+    returns compact previews.
 
     Args:
         audit_id: The audit session id. Empty = the most recent audit in

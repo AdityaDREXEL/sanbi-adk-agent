@@ -112,7 +112,7 @@ gcloud run deploy sanbi-adk-agent \
 
 ## Tests
 
-244 offline tests cover the scoring formula, LLM-output coercion (None/string ranks, fenced JSON), citation extraction + Google-redirect filtering, leaderboard aggregation, engine-failure isolation, the platform classifier taxonomy, URL-verification verdicts (incl. the Reddit-OAuth and YouTube-oEmbed edge cases), growth-opportunity scoring to the decimal, the agents' session-state flow, and the MCP tool contract. All LLM/HTTP calls are mocked — the suite runs with zero credentials and zero API spend.
+267 offline tests cover the scoring formula, LLM-output coercion (None/string ranks, fenced JSON), citation extraction + Google-redirect filtering, leaderboard aggregation, engine-failure isolation, the platform classifier taxonomy, URL-verification verdicts (incl. the Reddit-OAuth and YouTube-oEmbed edge cases), growth-opportunity scoring to the decimal, the agents' session-state flow, and the MCP tool contract. All LLM/HTTP calls are mocked — the suite runs with zero credentials and zero API spend.
 
 ```bash
 pip install -r requirements-dev.txt
