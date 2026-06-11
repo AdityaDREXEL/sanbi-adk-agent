@@ -25,8 +25,19 @@ Run locally:
 """
 
 import logging
+import sys
 import uuid
+from pathlib import Path
 from typing import Optional
+
+# Ensure the repo root (which holds the `sanbi_core` package) is importable.
+# `adk web agents` only adds the agents/ directory to sys.path, so without this
+# bootstrap the repo-root `sanbi_core` package is invisible when ADK imports
+# this module. Same story in the Cloud Run image (WORKDIR /app). parents[2]:
+#   .../agents/sanbi_audit/agent.py -> .../agents/sanbi_audit -> .../agents -> repo root
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from google.adk.agents import Agent
 from google.adk.tools import ToolContext
