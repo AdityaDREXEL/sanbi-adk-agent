@@ -23,6 +23,11 @@ A **coordinator agent** routes the conversation between two specialists — an a
 
 ## Architecture
 
+![Sanbi ADK Agent architecture](docs/architecture.png)
+
+<details>
+<summary>ASCII version</summary>
+
 ```
                         ┌────────────────────────────────┐
   user ── ADK web UI ──▶│  sanbi_coordinator (root agent)  │   model: gemini-2.5-flash
@@ -51,6 +56,8 @@ A **coordinator agent** routes the conversation between two specialists — an a
                         └─────────────────────────┘
                                   deployed on Cloud Run
 ```
+
+</details>
 
 - **`sanbi_core/`** — the engine, ported from production: planning (brand research + prompt generation), execution (multi-engine querying), analysis (grading + leaderboard), platforms (deterministic citation-source taxonomy), verifier (anti-hallucination URL checks), growth (opportunity scoring + platform playbooks).
 - **`agents/sanbi_audit/`** — the ADK multi-agent system: coordinator + audit/growth specialists.
