@@ -1,0 +1,20 @@
+# Keep the Cloud Build context lean and secrets out of the image.
+.venv/
+venv/
+.git/
+.gitignore
+.env
+*.env.local
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+tests/
+docs/
+scripts/
+*.md
+LICENSE
+.DS_Store
+.idea/
+.vscode/
+*.log

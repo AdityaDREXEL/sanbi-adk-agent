@@ -24,6 +24,7 @@ Run locally:
     adk web agents          # from repo root → http://localhost:8000
 """
 
+import asyncio
 import logging
 import sys
 import uuid
@@ -167,11 +168,17 @@ async def query_engines(audit_id: str = "", tool_context: ToolContext = None) ->
     if not audit:
         return {"error": f"Unknown audit_id '{audit_id or aid}'. Call generate_audit_prompts first."}
 
+    # All prompts in parallel; each query_all_engines already fans out across
+    # engines internally and never raises (per-engine failures are isolated).
+    prompts = audit["prompts"]
+    all_engine_results = await asyncio.gather(
+        *[query_all_engines(p["search_query"], audit["location"]) for p in prompts]
+    )
+
     responses = []
     previews = []
-    for p in audit["prompts"]:
+    for p, engine_results in zip(prompts, all_engine_results):
         prompt_text = p["search_query"]
-        engine_results = await query_all_engines(prompt_text, audit["location"])
         for engine, res in engine_results.items():
             responses.append({
                 "prompt": prompt_text,
@@ -223,15 +230,25 @@ async def grade_responses(audit_id: str = "", tool_context: ToolContext = None) 
     if not audit["responses"]:
         return {"error": "No responses collected yet. Call query_engines first."}
 
-    audit_log = []
-    for entry in audit["responses"]:
-        grade = await grade_result(entry["prompt"], entry["response"], audit["domain"])
-        audit_log.append({
+    # Grade all responses in parallel (grade_result never raises — it returns
+    # _empty_grade() on failure). Semaphore caps concurrent grader calls.
+    sem = asyncio.Semaphore(8)
+
+    async def _graded(entry):
+        async with sem:
+            return await grade_result(entry["prompt"], entry["response"], audit["domain"])
+
+    grades = await asyncio.gather(*[_graded(e) for e in audit["responses"]])
+
+    audit_log = [
+        {
             "prompt": entry["prompt"],
             "prompt_type": entry["prompt_type"],
             "engine": entry["engine"],
             "grade": grade,
-        })
+        }
+        for entry, grade in zip(audit["responses"], grades)
+    ]
     audit["audit_log"] = audit_log
     _save_audit(tool_context, aid, audit)
 

@@ -18,6 +18,7 @@ Run (HTTP, for Cloud Run):
     MCP_TRANSPORT=http MCP_PORT=8081 python -m mcp_server.server
 """
 
+import asyncio
 import logging
 import os
 
@@ -86,18 +87,34 @@ async def run_visibility_audit(
         identity=identity,
     )
 
-    # 2. Execute (every prompt × every engine)
-    audit_log = []
-    for p in prompts:
-        engine_results = await query_all_engines(p["search_query"], location)
+    # 2. Execute (every prompt × every engine — all prompts in parallel)
+    all_engine_results = await asyncio.gather(
+        *[query_all_engines(p["search_query"], location) for p in prompts]
+    )
+
+    flat = []  # (prompt_dict, engine, response)
+    for p, engine_results in zip(prompts, all_engine_results):
         for engine, res in engine_results.items():
-            grade = await grade_result(p["search_query"], res, domain)
-            audit_log.append({
-                "prompt": p["search_query"],
-                "prompt_type": p["prompt_type"],
-                "engine": engine,
-                "grade": grade,
-            })
+            flat.append((p, engine, res))
+
+    # Grade everything in parallel (grade_result never raises); cap concurrency.
+    sem = asyncio.Semaphore(8)
+
+    async def _graded(p, res):
+        async with sem:
+            return await grade_result(p["search_query"], res, domain)
+
+    grades = await asyncio.gather(*[_graded(p, res) for p, _, res in flat])
+
+    audit_log = [
+        {
+            "prompt": p["search_query"],
+            "prompt_type": p["prompt_type"],
+            "engine": engine,
+            "grade": grade,
+        }
+        for (p, engine, _), grade in zip(flat, grades)
+    ]
 
     # 3. Aggregate
     leaderboard = build_leaderboard(audit_log, brand_name)
