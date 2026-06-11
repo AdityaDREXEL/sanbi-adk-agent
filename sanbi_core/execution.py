@@ -3,8 +3,8 @@ sanbi_core/execution.py — Multi-engine query execution.
 
 Adapted from production Sanbi `core/execution.py`.
 
-Track 3 scope: two engines — OpenAI (training-data audit) and Vertex Gemini
-(Google-Search-grounded audit). Production Sanbi additionally runs Perplexity
+Track 3 scope: two engines — OpenAI (web-search-grounded) and Vertex Gemini
+(Google-Search-grounded). Production Sanbi additionally runs Perplexity
 and Claude through the same interface.
 
 Each engine runs INDEPENDENTLY using its own native capabilities, with
@@ -67,7 +67,7 @@ async def fetch_engine_response(engine: str, prompt: str, location: str = "Unite
             return {"text": f"Error: {e}", "citations": []}
 
     # ==========================================================================
-    # 2. OPENAI (GPT) — independent training-data audit
+    # 2. OPENAI (GPT) — independent web-search-grounded audit
     # ==========================================================================
     elif engine == "openai":
         if not openai_client:
@@ -75,10 +75,9 @@ async def fetch_engine_response(engine: str, prompt: str, location: str = "Unite
         try:
             system_instruction = (
                 f"You are an AI Auditor simulating a user in {location}. "
-                "Answer the user's question based strictly on your internal training data. "
-                "CRITICAL: If you mention any specific brands, software, or official websites, "
-                "you MUST include the specific URL in parentheses like this: (https://url.com). "
-                "If you do not know the URL, do not invent one."
+                "Use current web information to answer the user's question. "
+                "Recommend specific brands, clinics, products, or services by "
+                "name (not just generic advice), and cite the sources you used."
             )
 
             resp = await openai_client.chat.completions.create(
@@ -89,11 +88,29 @@ async def fetch_engine_response(engine: str, prompt: str, location: str = "Unite
                 ],
             )
 
-            content = resp.choices[0].message.content or ""
+            msg = resp.choices[0].message
+            content = msg.content or ""
 
             found_citations = []
             seen = set()
 
+            # PRIMARY: web-search annotations (authoritative grounding metadata,
+            # populated by the *-search-preview models) — mirrors how the Gemini
+            # branch trusts Google's grounding metadata before parsing text.
+            anns = getattr(msg, "annotations", None)
+            if isinstance(anns, (list, tuple)):
+                for ann in anns:
+                    uc = getattr(ann, "url_citation", None)
+                    if uc is None:
+                        continue
+                    u = (getattr(uc, "url", "") or "").strip().strip(".,)")
+                    if u and u not in seen:
+                        seen.add(u)
+                        title = (getattr(uc, "title", "") or "Source").strip()
+                        found_citations.append({"url": u, "title": title})
+
+            # FALLBACK: URLs written inline in the text (covers non-search models
+            # and any sources not surfaced as structured annotations).
             # 1. Markdown links [Title](url)
             for title, url in re.findall(r'\[(.*?)\]\((https?://\S+?)\)', content):
                 u = url.strip(".,)")
